@@ -83,7 +83,7 @@ Two layers, both zero-dependency, both gating the deploy:
 | Gate | Command | Checks |
 |---|---|---|
 | Logic (Node, no browser) | `node harness.js` | 179 |
-| Browser (headless Chrome) | `node scripts/verify_browser.js` | 42 |
+| Browser (headless Chrome) | `node scripts/verify_browser.js` | 63 |
 
 `harness.js` stubs the DOM and a **strict** canvas-2D proxy that throws on any
 member that isn't a real `CanvasRenderingContext2D` property, then drives real
