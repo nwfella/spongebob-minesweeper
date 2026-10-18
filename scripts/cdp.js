@@ -89,64 +89,72 @@ async function connect(port) {
   return { ws, send, sessionId, close: () => { try { ws.close(); } catch (e) {} } };
 }
 
-/* Drive one page: emulate a device, navigate, run fn(api). */
+/* Drive one page: emulate a device, navigate, run fn(api).
+   Chrome's first launch can be slow (AV scanning, cold start) and occasionally
+   never writes DevToolsActivePort — retry the whole launch rather than failing
+   the gate on a flake. */
 async function withPage(opts, fn) {
   const {
     url, width = 390, height = 844, dpr = 3, mobile = true,
-    waitMs = 900, chrome = findChrome()
+    waitMs = 900, chrome = findChrome(), attempts = 3
   } = opts;
-  const { port, proc, dir } = await launch(chrome);
-  const cdp = await connect(port);
-  const { send, sessionId } = cdp;
-  let result;
-  try {
-    await send('Page.enable', {}, sessionId);
-    await send('Runtime.enable', {}, sessionId);
-    await send('Emulation.setDeviceMetricsOverride',
-      { width, height, deviceScaleFactor: dpr, mobile }, sessionId);
-    if (mobile) {
-      await send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }, sessionId);
-      await send('Emulation.setEmitTouchEventsForMouse', { enabled: true, configuration: 'mobile' }, sessionId);
-    }
-    await send('Page.navigate', { url }, sessionId);
-    await sleep(waitMs);
-    result = await fn({
-      send: (m, p) => send(m, p, sessionId),
-      /* evaluate an expression in the page and return its JSON value */
-      evaluate: async (expr) => {
-        const r = await send('Runtime.evaluate',
-          { expression: expr, returnByValue: true, awaitPromise: true }, sessionId);
-        if (r.exceptionDetails) throw new Error('page eval threw: ' + (r.exceptionDetails.exception || {}).description);
-        return r.result ? r.result.value : undefined;
-      },
-      /* poll until expr returns a truthy value (for delayed in-page reports) */
-      poll: async (expr, timeoutMs = 8000) => {
-        const t0 = Date.now();
-        for (;;) {
-          const v = await (async () => {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let proc = null, dir = null, cdp = null;
+    try {
+      const launched = await launch(chrome);
+      proc = launched.proc; dir = launched.dir;
+      cdp = await connect(launched.port);
+      const { send, sessionId } = cdp;
+      await send('Page.enable', {}, sessionId);
+      await send('Runtime.enable', {}, sessionId);
+      await send('Emulation.setDeviceMetricsOverride',
+        { width, height, deviceScaleFactor: dpr, mobile }, sessionId);
+      if (mobile) {
+        await send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }, sessionId);
+        await send('Emulation.setEmitTouchEventsForMouse', { enabled: true, configuration: 'mobile' }, sessionId);
+      }
+      await send('Page.navigate', { url }, sessionId);
+      await sleep(waitMs);
+      return await fn({
+        send: (m, p) => send(m, p, sessionId),
+        /* evaluate an expression in the page and return its JSON value */
+        evaluate: async (expr) => {
+          const r = await send('Runtime.evaluate',
+            { expression: expr, returnByValue: true, awaitPromise: true }, sessionId);
+          if (r.exceptionDetails) throw new Error('page eval threw: ' + (r.exceptionDetails.exception || {}).description);
+          return r.result ? r.result.value : undefined;
+        },
+        /* poll until expr returns a truthy value (for delayed in-page reports) */
+        poll: async (expr, timeoutMs = 8000) => {
+          const t0 = Date.now();
+          for (;;) {
             const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true }, sessionId);
-            return r.result ? r.result.value : undefined;
-          })();
-          if (v) return v;
-          if (Date.now() - t0 > timeoutMs) return v;
-          await sleep(200);
+            const v = r.result ? r.result.value : undefined;
+            if (v) return v;
+            if (Date.now() - t0 > timeoutMs) return v;
+            await sleep(200);
+          }
+        },
+        screenshot: async (file, { fullPage = true } = {}) => {
+          const r = await send('Page.captureScreenshot',
+            { format: 'png', captureBeyondViewport: fullPage }, sessionId);
+          fs.writeFileSync(file, Buffer.from(r.data, 'base64'));
+          return file;
         }
-      },
-      screenshot: async (file, { fullPage = true } = {}) => {
-        const r = await send('Page.captureScreenshot',
-          { format: 'png', captureBeyondViewport: fullPage }, sessionId);
-        fs.writeFileSync(file, Buffer.from(r.data, 'base64'));
-        return file;
-      },
-      metrics: () => send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: dpr, mobile }, sessionId)
-    });
-  } finally {
-    cdp.close();
-    try { proc.kill(); } catch (e) {}
-    await sleep(150);
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+      });
+    } catch (e) {
+      lastErr = e;
+      if (attempt === attempts) break;
+      await sleep(600 * attempt);
+    } finally {
+      if (cdp) cdp.close();
+      if (proc) { try { proc.kill(); } catch (e) {} }
+      await sleep(150);
+      if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {} }
+    }
   }
-  return result;
+  throw new Error('CDP session failed after ' + attempts + ' attempts: ' + (lastErr && lastErr.message));
 }
 
 module.exports = { withPage, findChrome, sleep };
